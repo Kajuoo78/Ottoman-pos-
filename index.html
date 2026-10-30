@@ -205,6 +205,18 @@ img{max-width:100%}
 .authcard h1{margin:0;font-family:var(--display);font-size:30px;letter-spacing:.03em;text-transform:uppercase}
 .authcard .brand{margin-bottom:2px}
 .authcard p{margin:0;color:var(--muted)}
+.xs{margin:0 16px 12px;border:1px solid var(--line);border-radius:10px;background:color-mix(in srgb,var(--accent) 7%,var(--surface));padding:10px 12px;display:grid;gap:8px}
+.xs-h{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.xs-b{display:grid;gap:6px}
+.xs-i{display:flex;flex-direction:column;align-items:flex-start;gap:1px;text-align:left;border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:8px 10px;min-height:44px}
+.xs-i:hover{border-color:var(--accent)}
+.xs-n{font-weight:600}
+.xs-s{font-size:12px;color:var(--muted)}
+.coach{border-top:1px solid var(--line);padding-top:10px}
+.coach:first-of-type{border-top:0;padding-top:0}
+.coach-h{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;justify-content:space-between}
+.coach ul{margin:6px 0 0;padding-left:18px;display:grid;gap:4px}
+.sub{font-size:12px;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -253,6 +265,7 @@ img{max-width:100%}
   <section id="v-stock" hidden><div class="bar" id="tb-stock"></div><div id="bd-stock"></div></section>
   <section id="v-sales" hidden><div class="bar" id="tb-sales"></div><div id="bd-sales"></div></section>
   <section id="v-reports" hidden><div class="bar" id="tb-reports"></div><div id="bd-reports"></div></section>
+  <section id="v-smart" hidden><div class="bar" id="tb-smart"></div><div id="bd-smart"></div></section>
   <section id="v-team" hidden><div class="bar" id="tb-team"></div><div id="bd-team"></div></section>
   <section id="v-setup" hidden><div class="bar" id="tb-setup"></div><div id="bd-setup"></div></section>
 </main>
@@ -691,6 +704,7 @@ function renderCart(){
   }).join("");
   $("#clearcart").hidden=!ui.cart.length;
   $("#cart-title").textContent=ui.fromQuote?"Quotation to sale":"Current sale";
+  renderXsell();
   renderMethods();renderPayBody();updateTotals();
 }
 function renderMethods(){
@@ -1324,6 +1338,194 @@ async function saveExp(id){
   D.expenses[eid]=rec;closeModal();toast("Expense saved");renderAll();
 }
 
+/* ================= SMART: restock advice, cross-sell, cashier coaching =================
+   Everything here is worked out inside the app from the shop's own sales and stock records.
+   No outside service, no monthly cost, and it works with whatever data the shop has built up. */
+var SMART={lead:3,cover:14,win:28,dead:60,coachDays:28};
+ui.smartLoc="all";
+
+function liveSales(){var a=[];Object.keys(D.sales).forEach(function(k){if(!D.voids[k])a.push(D.sales[k])});return a}
+
+/* ---------- demand and restock ---------- */
+function smartDemand(locIds){
+  var now=Date.now(),set={},by={},first=now,n=0,recv={};
+  locIds.forEach(function(l){set[l]=1});
+  Object.keys(D.moves).forEach(function(k){
+    var mv=D.moves[k],to=mv.to;
+    if((mv.type==="receive"||mv.type==="transfer")&&set[to]&&mv.ts){(mv.lines||[]).forEach(function(ln){if(!recv[ln.pid]||mv.ts<recv[ln.pid])recv[ln.pid]=mv.ts})}
+  });
+  liveSales().forEach(function(s){
+    if(!set[s.loc]||!s.ts)return;
+    n++;if(s.ts<first)first=s.ts;
+  });
+  var days=Math.max(7,Math.min(SMART.win,Math.ceil((now-first)/864e5)||7));
+  var from=now-days*864e5,from7=now-7*864e5;
+  liveSales().forEach(function(s){
+    if(!set[s.loc]||!s.ts)return;
+    (s.lines||[]).forEach(function(l){
+      var x=by[l.pid]||(by[l.pid]={sold:0,s7:0,prev:0,last:0}),q=+l.qty||0;
+      if(s.ts>x.last)x.last=s.ts;
+      if(s.ts>=from){x.sold+=q;if(s.ts>=from7)x.s7+=q;else x.prev+=q}
+    });
+  });
+  return {days:days,by:by,recv:recv,sales:n};
+}
+function restockRows(locIds){
+  var d=smartDemand(locIds),now=Date.now(),rows=[];
+  prodList().forEach(function(p){
+    var x=d.by[p.id]||{sold:0,s7:0,prev:0,last:0},stock=0;
+    locIds.forEach(function(l){stock+=stockAt(l,p.id)});
+    var daily=x.sold/d.days,cover=daily>0&&stock>0?stock/daily:(daily>0?0:Infinity);
+    var need=Math.max(0,Math.ceil(daily*(SMART.lead+SMART.cover)-Math.max(stock,0)));
+    var st="ok";
+    if(daily>0){st=stock<=0?"out":cover<=SMART.lead?"urgent":cover<=7?"soon":"ok"}
+    var trend="";
+    if(d.days>=14&&x.sold>=6){var r7=x.s7/7,rp=x.prev/(d.days-7);if(rp>0&&r7>=rp*1.4)trend="rising";else if(rp>0&&r7<=rp*0.6)trend="falling";else if(rp===0&&r7>0)trend="rising"}
+    var oldStock=d.recv[p.id]&&(now-d.recv[p.id])>SMART.dead*864e5;
+    var dead=stock>0&&oldStock&&(!x.last||(now-x.last)>SMART.dead*864e5);
+    var cost=costNow(p.id);
+    rows.push({p:p,stock:stock,daily:daily,cover:cover,need:need,status:st,trend:trend,dead:dead,tied:cost!=null?Math.max(stock,0)*cost:null,sold7:x.s7,last:x.last});
+  });
+  return {rows:rows,days:d.days,sales:d.sales};
+}
+var ORD={out:0,urgent:1,soon:2,ok:3};
+
+/* ---------- cross-sell: what is usually bought together ---------- */
+var xsCache={sig:"",pair:{},cnt:{}};
+function xsBuild(){
+  var sig=Object.keys(D.sales).length+":"+Object.keys(D.voids).length;
+  if(xsCache.sig===sig)return xsCache;
+  var pair={},cnt={};
+  liveSales().forEach(function(s){
+    var ids=[],seen={};
+    (s.lines||[]).forEach(function(l){if(!seen[l.pid]){seen[l.pid]=1;ids.push(l.pid)}});
+    ids.forEach(function(a){cnt[a]=(cnt[a]||0)+1});
+    if(ids.length>1&&ids.length<=12)ids.forEach(function(a){ids.forEach(function(b){if(a!==b){var m=pair[a]||(pair[a]={});m[b]=(m[b]||0)+1}})});
+  });
+  xsCache={sig:sig,pair:pair,cnt:cnt};return xsCache;
+}
+function crossSell(limit){
+  var C=xsBuild(),loc=myLoc(),inCart={},score={},evid={},neg=cfg().allowNeg;
+  ui.cart.forEach(function(l){inCart[l.pid]=1});
+  ui.cart.forEach(function(l){
+    var m=C.pair[l.pid],n=C.cnt[l.pid];if(!m||!n)return;
+    Object.keys(m).forEach(function(q){if(inCart[q]||m[q]<2)return;score[q]=(score[q]||0)+m[q]/n;evid[q]=Math.max(evid[q]||0,m[q])});
+  });
+  return Object.keys(score).filter(function(q){
+    var p=D.products[q];return p&&p.active!==false&&p.sellable!==false&&loc&&(neg||stockAt(loc,q)>0);
+  }).sort(function(a,b){return score[b]-score[a]}).slice(0,limit||3).map(function(q){return {id:q,p:D.products[q],n:evid[q]}});
+}
+function renderXsell(){
+  var el=$("#xsell");
+  if(!el){var ln=$("#lines");if(!ln)return;el=document.createElement("div");el.id="xsell";ln.parentNode.insertBefore(el,ln.nextSibling)}
+  var list=ui.cart.length&&env.canWrite?crossSell(3):[];
+  if(!list.length){el.innerHTML="";el.hidden=true;return}
+  el.hidden=false;
+  el.innerHTML='<div class="xs"><div class="xs-h">Customers also buy</div><div class="xs-b">'+list.map(function(x){
+    return '<button class="xs-i" data-act="add" data-id="'+esc(x.id)+'"><span class="xs-n">+ '+esc(x.p.name)+'</span><span class="xs-s">KES '+num(x.p.price)+' &middot; bought together '+x.n+' times</span></button>';
+  }).join("")+'</div></div>';
+}
+
+/* ---------- cashier coaching ---------- */
+function coachData(days){
+  var from=Date.now()-days*864e5,by={},T={n:0,rev:0,items:0,disc:0,base:0,cust:0,voids:0};
+  Object.keys(D.sales).forEach(function(k){
+    var s=D.sales[k];if(!s.ts||s.ts<from)return;
+    var uid=s.by||"?",r=by[uid]||(by[uid]={uid:uid,n:0,rev:0,items:0,disc:0,base:0,cust:0,voids:0});
+    if(D.voids[k]){r.voids++;T.voids++;return}
+    r.n++;T.n++;r.rev+=s.total||0;T.rev+=s.total||0;
+    (s.lines||[]).forEach(function(l){
+      var q=+l.qty||0,p=D.products[l.pid];r.items+=q;T.items+=q;
+      if(p&&p.price>0){var b=q*p.price,d=q*Math.max(0,p.price-l.price);r.base+=b;T.base+=b;r.disc+=d;T.disc+=d}
+    });
+    if(s.cid||s.cname){r.cust++;T.cust++}
+  });
+  function fin(r){r.basket=r.n?r.rev/r.n:0;r.itemsPer=r.n?r.items/r.n:0;r.discPct=r.base?r.disc/r.base*100:0;r.attach=r.n?r.cust/r.n*100:0;r.voidPct=(r.n+r.voids)?r.voids/(r.n+r.voids)*100:0;return r}
+  fin(T);
+  var list=Object.keys(by).map(function(k){return fin(by[k])}).sort(function(a,b){return b.rev-a.rev});
+  return {T:T,list:list};
+}
+function coachTips(r,T){
+  if(r.n<5)return ["Not enough sales yet to coach (needs at least 5 in this period)."];
+  var t=[];
+  if(T.basket>0&&r.basket<T.basket*0.8)t.push("Average sale is "+KES(r.basket)+" against "+KES(T.basket)+" for the team. Offer the related items shown under “Customers also buy”.");
+  if(T.itemsPer>0&&r.itemsPer<T.itemsPer*0.8)t.push("Fewer items per sale ("+r.itemsPer.toFixed(1)+") than the team ("+T.itemsPer.toFixed(1)+"). Ask what else the job needs, such as fittings, tape or clips.");
+  if(r.discPct-T.discPct>=3)t.push("Sells about "+r.discPct.toFixed(1)+"% below list price, the team averages "+T.discPct.toFixed(1)+"%. Hold the list price unless the customer really needs a lower one.");
+  if(r.attach<30)t.push("Only "+Math.round(r.attach)+"% of sales have a customer attached. Ask for a name or phone so they earn loyalty points.");
+  if(r.voids>=3||r.voidPct>5)t.push(r.voids+" voided sales in this period. Find out why and whether more training is needed.");
+  if(!t.length)t.push("Doing well: sales, basket size and pricing are in line with or better than the team.");
+  return t;
+}
+
+/* ---------- the Smart tab (managers only) ---------- */
+function smartLocIds(){return ui.smartLoc==="all"?Object.keys(D.locations):[ui.smartLoc]}
+function stPill(r){
+  if(r.status==="out")return '<span class="pill out">Out, still selling</span>';
+  if(r.status==="urgent")return '<span class="pill bad">Order now</span>';
+  if(r.status==="soon")return '<span class="pill low">Order soon</span>';
+  return '<span class="pill ok">OK</span>';
+}
+function trendTxt(r){return r.trend==="rising"?" &#9650; selling faster":r.trend==="falling"?" &#9660; slowing down":""}
+function smartRestockList(R){
+  return R.rows.filter(function(r){return r.status!=="ok"||r.need>0}).filter(function(r){return r.daily>0}).sort(function(a,b){return ORD[a.status]-ORD[b.status]||a.cover-b.cover});
+}
+VIEWS.smart={
+  build:function(){
+    $("#tb-smart").innerHTML='<div class="acts"><select id="smloc" class="sel" aria-label="Location"></select></div><div class="acts"><button class="btn sm" data-act="smprint">Print restock list</button><button class="btn sec2 sm" data-act="smexport">Export CSV</button></div>';
+  },
+  body:function(){
+    var ls=locList(),sel=$("#smloc"),sg=ls.map(function(l){return l.id+l.name}).join("|")+"|"+ui.smartLoc;
+    if(sel.dataset.sig!==sg){sel.dataset.sig=sg;sel.innerHTML='<option value="all"'+(ui.smartLoc==="all"?" selected":"")+'>All locations</option>'+ls.map(function(l){return '<option value="'+esc(l.id)+'"'+(l.id===ui.smartLoc?" selected":"")+'>'+esc(l.name)+'</option>'}).join("")}
+    if(ui.smartLoc!=="all"&&!D.locations[ui.smartLoc])ui.smartLoc="all";
+    var R=restockRows(smartLocIds()),need=smartRestockList(R),dead=R.rows.filter(function(r){return r.dead}).sort(function(a,b){return (b.tied||0)-(a.tied||0)});
+    var tied=0;dead.forEach(function(r){tied+=r.tied||0});
+    var top=R.rows.slice().sort(function(a,b){return b.sold7-a.sold7})[0];
+    var h="";
+    if(R.sales<10)h+='<div class="banner"><span>Only '+R.sales+' sale'+(R.sales===1?"":"s")+' recorded so far. The advice below gets more accurate after a week or two of normal trading.</span></div>';
+    h+='<div class="stats"><div class="stat main"><div class="l">Items to reorder</div><div class="v">'+need.filter(function(r){return r.need>0}).length+'</div></div>'+
+      '<div class="stat"><div class="l">Out of stock but selling</div><div class="v '+(need.some(function(r){return r.status==="out"})?"neg":"")+'">'+need.filter(function(r){return r.status==="out"}).length+'</div></div>'+
+      '<div class="stat"><div class="l">Slow stock (cost tied up)</div><div class="v">'+KES(tied)+'</div></div>'+
+      '<div class="stat"><div class="l">Best seller, last 7 days</div><div class="v" style="font-size:16px">'+(top&&top.sold7>0?esc(top.p.name)+" ("+num(top.sold7)+")":"None yet")+'</div></div></div>';
+    h+='<div class="cols">';
+    h+='<div class="card" style="grid-column:1/-1"><h3>Restock advice</h3><div class="hint" style="margin:0">Based on the last '+R.days+' days of sales. Allows '+SMART.lead+' days for delivery and '+SMART.cover+' days of cover. These are estimates to guide your ordering.</div>';
+    if(!need.length)h+='<div class="empty">Nothing needs reordering right now.</div>';
+    else h+='<div class="tw"><table><thead><tr><th>Item</th><th class="n">In stock</th><th class="n">Sells per day</th><th class="n">Lasts</th><th class="n">Suggested order</th><th>Status</th></tr></thead><tbody>'+need.slice(0,60).map(function(r){
+      return '<tr><td>'+esc(r.p.name)+'<div class="sub">'+esc(r.p.cat||"General")+'</div></td><td class="n">'+num(Math.max(r.stock,0))+'</td><td class="n">'+(r.daily<10?r.daily.toFixed(1):num(r.daily))+'</td><td class="n">'+(r.cover===Infinity?"-":(r.cover<1?"under 1 day":Math.round(r.cover)+" days"))+'</td><td class="n"><b>'+(r.need>0?num(r.need)+" "+esc(r.p.unit||"pc"):"-")+'</b></td><td>'+stPill(r)+'<span class="sub">'+trendTxt(r)+'</span></td></tr>';
+    }).join("")+'</tbody></table></div>';
+    h+='</div>';
+    h+='<div class="card"><h3>Slow-moving stock</h3><div class="hint" style="margin:0">In stock, but not sold for '+SMART.dead+' days or more. Consider a promotion or stop reordering.</div>';
+    if(!dead.length)h+='<div class="empty">No slow-moving stock found.</div>';
+    else h+='<div class="tw"><table><thead><tr><th>Item</th><th class="n">In stock</th><th class="n">Cost tied up</th></tr></thead><tbody>'+dead.slice(0,15).map(function(r){return '<tr><td>'+esc(r.p.name)+'<div class="sub">'+(r.last?"Last sold "+fmtDay(r.last):"Never sold")+'</div></td><td class="n">'+num(r.stock)+'</td><td class="n">'+(r.tied==null?"-":num(r.tied))+'</td></tr>'}).join("")+'</tbody></table></div>';
+    h+='</div>';
+    var C=coachData(SMART.coachDays);
+    h+='<div class="card"><h3>Cashier coaching</h3><div class="hint" style="margin:0">Last '+SMART.coachDays+' days. Tips come from comparing each cashier with the team.</div>';
+    if(!C.list.length)h+='<div class="empty">No sales in this period yet.</div>';
+    else h+=C.list.map(function(r){
+      return '<div class="coach"><div class="coach-h"><b>'+esc(nameOf(r.uid))+'</b><span class="sub">'+r.n+' sale'+(r.n===1?"":"s")+' &middot; '+KES(r.rev)+' &middot; average '+KES(r.basket)+'</span></div><ul>'+coachTips(r,C.T).map(function(t){return '<li>'+esc(t)+'</li>'}).join("")+'</ul></div>';
+    }).join("");
+    h+='</div></div>';
+    $("#bd-smart").innerHTML=h;
+  }
+};
+document.addEventListener("click",function(e){
+  var el=e.target.closest&&e.target.closest("[data-act]");if(!el)return;
+  var a=el.dataset.act;
+  if(a!=="smexport"&&a!=="smprint")return;
+  var R=restockRows(smartLocIds()),list=smartRestockList(R),where=ui.smartLoc==="all"?"All locations":locName(ui.smartLoc);
+  if(a==="smexport"){
+    var rows=[["Item","Category","Location","In stock","Sells per day","Days left","Suggested order","Status","Trend"]];
+    R.rows.filter(function(r){return r.daily>0||r.stock>0}).sort(function(x,y){return ORD[x.status]-ORD[y.status]||x.cover-y.cover}).forEach(function(r){rows.push([r.p.name,r.p.cat||"",where,Math.max(r.stock,0),r.daily.toFixed(2),r.cover===Infinity?"":Math.round(r.cover),r.need,r.status,r.trend])});
+    saveFile("ottoman-restock-"+ymd(Date.now())+".csv",toCsv(rows),"Exported");
+  }else{
+    var body='<h1>Restock list</h1><div class="muted">'+esc(where)+' &middot; '+esc(fmtDay(Date.now()))+' &middot; based on the last '+R.days+' days of sales</div><table><thead><tr><th>Item</th><th class="n">In stock</th><th class="n">Sells/day</th><th class="n">Days left</th><th class="n">Order</th></tr></thead><tbody>'+
+      (list.length?list.map(function(r){return '<tr><td>'+esc(r.p.name)+'</td><td class="n">'+num(Math.max(r.stock,0))+'</td><td class="n">'+r.daily.toFixed(1)+'</td><td class="n">'+(r.cover===Infinity?"-":Math.round(r.cover))+'</td><td class="n"><b>'+(r.need>0?num(r.need):"-")+'</b></td></tr>'}).join(""):'<tr><td colspan="5">Nothing needs reordering.</td></tr>')+'</tbody></table>';
+    saveFile("restock-list-"+ymd(Date.now())+".html",printDoc("Restock list",DOC_CSS,body),"Ready to print");
+  }
+});
+document.addEventListener("change",function(e){
+  if(e.target&&e.target.id==="smloc"){ui.smartLoc=e.target.value;VIEWS.smart.body()}
+});
+
 
 /* ================= TEAM (manager) ================= */
 VIEWS.team={
@@ -1447,7 +1649,7 @@ async function removeSamples(){
 /* ================= shell: tabs, gate, render ================= */
 function tabsFor(){
   var t=[["sell","Sell"],["quotes","Quotes"],["customers","Customers"],["stock","Stock"],["sales","Sales"]];
-  if(env.admin)t.push(["reports","Reports"],["team","Team"],["setup","Setup"]);
+  if(env.admin)t.push(["reports","Reports"],["smart","Smart"],["team","Team"],["setup","Setup"]);
   return t;
 }
 var built={},tabsSig="";
