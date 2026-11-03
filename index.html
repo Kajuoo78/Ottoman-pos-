@@ -333,8 +333,148 @@ var configured=!!(C.url&&C.key)&&!/YOUR-|PASTE/i.test(C.url+C.key);
 var sb=null,me=null,started=false,cache={},listeners={},mode="in",lastReload=0;
 var resolveReady,ready=new Promise(function(r){resolveReady=r});
 
-function wrap(e){var x=new Error((e&&e.message)||"Request failed");x.code=e&&e.code;x.rule=!!(e&&e.code==="P0001");return x}
+function isNetErr(e){
+  if(!e)return false;
+  if(e.timeout)return true;
+  if(e.code)return false;
+  return navigator.onLine===false||/fetch|network|load failed|timed? ?out|abort/i.test(String(e.message||e));
+}
+function wrap(e){var x=new Error((e&&e.message)||"Request failed");x.code=e&&e.code;x.rule=!!(e&&e.code==="P0001");x.net=isNetErr(e);return x}
 function clone(o){return JSON.parse(JSON.stringify(o))}
+
+/* ---------- offline: saved copy of the shop data, and a queue of sales made while offline ---------- */
+var IDBP=null;
+function idb(){
+  if(IDBP)return IDBP;
+  IDBP=new Promise(function(res,rej){
+    try{
+      var r=indexedDB.open("ottoman-offline",1);
+      r.onupgradeneeded=function(){r.result.createObjectStore("kv")};
+      r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)};
+    }catch(e){rej(e)}
+  });
+  return IDBP;
+}
+function kvGet(k){return idb().then(function(d){return new Promise(function(res){var t=d.transaction("kv").objectStore("kv").get(k);t.onsuccess=function(){res(t.result)};t.onerror=function(){res(undefined)}})}).catch(function(){return undefined})}
+function kvSet(k,v){return idb().then(function(d){return new Promise(function(res){var t=d.transaction("kv","readwrite");t.objectStore("kv").put(v,k);t.oncomplete=function(){res(true)};t.onerror=function(){res(false)}})}).catch(function(){return false})}
+function kvClear(){return idb().then(function(d){return new Promise(function(res){var t=d.transaction("kv","readwrite");t.objectStore("kv").clear();t.oncomplete=function(){res()};t.onerror=function(){res()}})}).catch(function(){})}
+
+var QUEUEABLE={sales:1,quotes:1,customers:1,payments:1};
+var STAMPED={sales:1,quotes:1,payments:1};
+var outbox=[],flushing=false,offlineBoot=false,persistTimers={};
+function ukey(k){return "u:"+(me?me.uid:"?")+":"+k}
+function saveOutbox(){kvSet(ukey("outbox"),outbox);paintBar()}
+function persistLater(c){
+  if(!me||persistTimers[c])return;
+  persistTimers[c]=setTimeout(function(){persistTimers[c]=null;if(cache[c])kvSet(ukey("c:"+c),cache[c])},2500);
+}
+function overlay(c,o){
+  outbox.forEach(function(it){
+    if(it.c!==c||it.state==="failed")return;
+    var d=Object.assign({},it.data,{_pending:true});
+    o[it.id]=it.op==="update"?Object.assign({},o[it.id]||{},d):d;
+  });
+  return o;
+}
+function withTimeout(p,ms){
+  return new Promise(function(res,rej){
+    var t=setTimeout(function(){rej({timeout:true,message:"timed out"})},ms);
+    p.then(function(v){clearTimeout(t);res(v)},function(e){clearTimeout(t);rej(e)});
+  });
+}
+async function direct(op){
+  if(op.kind==="set"){
+    var r=await sb.from("docs").upsert({collection:op.c,id:op.id,data:op.data},{onConflict:"collection,id"});
+    if(r.error)throw wrap(r.error);
+  }else{
+    var r2=await sb.rpc("doc_update",{p_collection:op.c,p_id:op.id,p_patch:op.data});
+    if(r2.error)throw wrap(r2.error);
+  }
+}
+function enqueue(op){
+  var d=clone(op.data);
+  if(op.kind==="set"&&STAMPED[op.c])d.ots=Date.now();
+  outbox.push({k:Date.now()+"-"+Math.random().toString(36).slice(2,7),c:op.c,id:op.id,op:op.kind,data:d,at:Date.now(),state:"pending",err:""});
+  saveOutbox();
+  local(op.c,op.id,Object.assign(clone(op.data),{_pending:true}),op.kind==="update");
+  setTimeout(flush,4000);
+}
+async function submit(op){
+  if(!QUEUEABLE[op.c]||!sb){await direct(op);local(op.c,op.id,op.data,op.kind==="update");return}
+  if(outbox.some(function(i){return i.state!=="failed"})||navigator.onLine===false){enqueue(op);return}
+  try{await withTimeout(direct(op),8000);local(op.c,op.id,op.data,op.kind==="update")}
+  catch(e){if(isNetErr(e)||(e&&e.net)){enqueue(op);return}throw e}
+}
+async function flush(){
+  if(flushing||!sb||!outbox.length)return;
+  flushing=true;var any=false;
+  try{
+    for(var i=0;i<outbox.length;i++){
+      var it=outbox[i];if(it.state==="failed")continue;
+      try{
+        await withTimeout(direct({c:it.c,id:it.id,kind:it.op,data:it.data}),15000);
+        outbox.splice(i,1);i--;any=true;saveOutbox();
+      }catch(e){
+        if(isNetErr(e)||(e&&e.net))break;
+        var done=false;
+        if(it.op==="set"){
+          try{var g=await sb.from("docs").select("id").eq("collection",it.c).eq("id",it.id).maybeSingle();done=!!(g.data)}catch(x){}
+        }
+        if(done){outbox.splice(i,1);i--;any=true;saveOutbox();continue}
+        it.state="failed";it.err=(e&&e.message)||"Rejected";saveOutbox();
+        if(it.op==="set"&&cache[it.c]){delete cache[it.c][it.id];notify(it.c)}
+      }
+    }
+  }finally{flushing=false}
+  paintBar();
+  if(any)loadEverything();
+}
+/* the little status pill and the "needs attention" list */
+var barEl=null;
+function ensureBar(){
+  if(barEl)return barEl;
+  var st=document.createElement("style");
+  st.textContent="#offbar{position:fixed;left:10px;bottom:10px;z-index:9000;background:#7A4A00;color:#fff;font:600 13px/1.2 system-ui,sans-serif;padding:8px 12px;border-radius:20px;box-shadow:0 2px 8px rgba(0,0,0,.3);cursor:pointer;border:0}#offbar.bad{background:#A31616}#offbar.ok{background:#1B6B3A}"+
+   "#offm{position:fixed;inset:0;z-index:9100;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;padding:16px}#offm .box{background:var(--surface,#fff);color:var(--text,#111);max-width:520px;width:100%;max-height:85vh;overflow:auto;border-radius:12px;padding:16px;font:14px/1.4 system-ui,sans-serif}#offm .it{border:1px solid rgba(128,128,128,.4);border-radius:8px;padding:8px;margin:8px 0}#offm button{margin:6px 6px 0 0;padding:6px 12px;border-radius:8px;border:1px solid rgba(128,128,128,.5);background:transparent;color:inherit;font:inherit;cursor:pointer}";
+  document.head.appendChild(st);
+  barEl=document.createElement("button");barEl.id="offbar";barEl.hidden=true;barEl.type="button";
+  barEl.onclick=openOutbox;document.body.appendChild(barEl);
+  return barEl;
+}
+function paintBar(){
+  if(!me)return;
+  var b=ensureBar(),pend=outbox.filter(function(i){return i.state!=="failed"}).length,bad=outbox.length-pend,off=navigator.onLine===false||offlineBoot;
+  b.className="";
+  if(bad){b.hidden=false;b.className="bad";b.textContent=bad+" saved on this device need attention"}
+  else if(pend){b.hidden=false;b.textContent=(off?"Offline: ":"Syncing: ")+pend+" waiting to save"}
+  else if(off){b.hidden=false;b.textContent="Offline: sales will save when the internet returns"}
+  else b.hidden=true;
+}
+function openOutbox(){
+  if(!outbox.length)return;
+  var m=document.createElement("div");m.id="offm";
+  var box=document.createElement("div");box.className="box";m.appendChild(box);
+  function draw(){
+    box.innerHTML="";
+    var h=document.createElement("b");h.textContent="Waiting to save";box.appendChild(h);
+    var p=document.createElement("p");p.textContent="These were made on this device while the internet was down. Waiting items save by themselves. Items that were refused need a manager's look: retry them, or export and discard.";box.appendChild(p);
+    outbox.forEach(function(it){
+      var d=document.createElement("div");d.className="it";
+      var t=it.c==="sales"?"Sale "+it.id+(it.data.total?" · KES "+it.data.total:""):it.c==="quotes"&&it.op==="set"?"Quotation "+it.id:it.c+" "+it.id;
+      var l=document.createElement("div");l.textContent=t+" · "+new Date(it.at).toLocaleString();d.appendChild(l);
+      var s=document.createElement("div");s.textContent=it.state==="failed"?"Refused: "+it.err:"Waiting";d.appendChild(s);
+      if(it.state==="failed"){
+        var r=document.createElement("button");r.textContent="Retry";r.onclick=function(){it.state="pending";it.err="";saveOutbox();flush();draw()};d.appendChild(r);
+        var x=document.createElement("button");x.textContent="Discard";x.onclick=function(){if(confirm("Discard this? It will not be saved.")){outbox.splice(outbox.indexOf(it),1);saveOutbox();draw()}};d.appendChild(x);
+      }
+      box.appendChild(d);
+    });
+    var e=document.createElement("button");e.textContent="Export a copy";e.onclick=function(){DL.save({filename:"waiting-"+Date.now()+".json",data:JSON.stringify(outbox,null,1)})};box.appendChild(e);
+    var c=document.createElement("button");c.textContent="Close";c.onclick=function(){m.remove()};box.appendChild(c);
+    if(!outbox.length)m.remove();
+  }
+  draw();document.body.appendChild(m);
+}
 
 /* ---------- sign-in screen ---------- */
 function showAuth(msg){q("#auth").hidden=false;if(msg)q("#au-msg").textContent=msg}
@@ -358,13 +498,24 @@ function errText(e){
   if(m.indexOf("fetch")>-1||m.indexOf("network")>-1)return "No connection. Check the internet and try again.";
   return (e&&e.message)||"Something went wrong. Try again.";
 }
-async function start(){
-  var r=await sb.rpc("get_me");
-  if(r.error||!r.data){showAuth("Could not load your account. "+errText(r.error));return}
-  me=r.data;started=true;q("#auth").hidden=true;
+async function start(uid){
+  var r;
+  try{r=await withTimeout(sb.rpc("get_me"),8000)}catch(e){r={error:e}}
+  if((r.error&&isNetErr(r.error))||(r.error&&r.error.timeout)){
+    var saved=uid?await kvGet("u:"+uid+":me"):null;
+    if(saved){me=saved;offlineBoot=true}
+  }else if(!r.error&&r.data){me=r.data;offlineBoot=false;kvSet(ukey("me"),me)}
+  if(!me){showAuth("Could not load your account. "+errText(r.error));return}
+  started=true;q("#auth").hidden=true;
+  outbox=(await kvGet(ukey("outbox")))||[];
   var so=q("#signout");so.hidden=false;
-  so.onclick=function(){sb.auth.signOut().then(function(){location.reload()})};
-  startRealtime();resolveReady();
+  so.onclick=function(){
+    var n=outbox.length;
+    if(n&&!confirm(n+" item(s) made offline have not been saved yet. If you sign out now they will be lost. Sign out anyway?"))return;
+    sb.auth.signOut().then(function(){return kvClear()}).then(function(){location.reload()});
+  };
+  startRealtime();resolveReady();paintBar();
+  if(outbox.length)setTimeout(flush,1500);
 }
 function wireAuth(){
   setMode("in");
@@ -378,7 +529,7 @@ function wireAuth(){
       var res=mode==="in"?await sb.auth.signInWithPassword({email:email,password:pass}):await sb.auth.signUp({email:email,password:pass,options:{data:{name:name}}});
       if(res.error){q("#au-msg").textContent=errText(res.error);btn.disabled=false;return}
       if(!res.data.session){q("#au-msg").textContent="Check your email and confirm your account, then sign in.";setMode("in");btn.disabled=false;return}
-      await start();
+      await start(res.data.session.user.id);
     }catch(e){q("#au-msg").textContent=errText(e)}
     btn.disabled=false;
   };
@@ -401,9 +552,12 @@ async function loadAll(c){
   }
   return out;
 }
+function loadEverything(){
+  Object.keys(cache).forEach(function(c){loadAll(c).then(function(o){cache[c]=overlay(c,o);offlineBoot=false;paintBar();notify(c)},function(){})});
+}
 function reloadAll(force){
   var now=Date.now();if(!force&&now-lastReload<15000)return;lastReload=now;
-  Object.keys(cache).forEach(function(c){loadAll(c).then(function(o){cache[c]=o;notify(c)},function(){})});
+  if(outbox.length)flush().then(loadEverything,loadEverything);else loadEverything();
 }
 function startRealtime(){
   sb.channel("docs-stream").on("postgres_changes",{event:"*",schema:"public",table:"docs"},function(p){
@@ -415,7 +569,12 @@ function startRealtime(){
     notify(c);
   }).subscribe(function(status){if(status==="SUBSCRIBED")reloadAll(true)});
   document.addEventListener("visibilitychange",function(){if(!document.hidden)reloadAll(false)});
-  window.addEventListener("online",function(){reloadAll(true)});
+  window.addEventListener("online",function(){
+    sb.rpc("get_me").then(function(r){if(r.data){if(r.data.level!==me.level){location.reload();return}me=r.data;offlineBoot=false;kvSet(ukey("me"),me)}});
+    reloadAll(true);paintBar();
+  });
+  window.addEventListener("offline",paintBar);
+  setInterval(function(){if(outbox.length)flush()},20000);
   setInterval(function(){if(!document.hidden)reloadAll(false)},60000);
 }
 function local(c,id,d,merge){
@@ -426,14 +585,8 @@ function local(c,id,d,merge){
 function ref(c,id){
   return {
     id:id,path:c+"/"+id,
-    set:async function(d){
-      var r=await sb.from("docs").upsert({collection:c,id:id,data:d},{onConflict:"collection,id"});
-      if(r.error)throw wrap(r.error);local(c,id,d,false);
-    },
-    update:async function(d){
-      var r=await sb.rpc("doc_update",{p_collection:c,p_id:id,p_patch:d});
-      if(r.error)throw wrap(r.error);local(c,id,d,true);
-    },
+    set:async function(d){return submit({c:c,id:id,kind:"set",data:d})},
+    update:async function(d){return submit({c:c,id:id,kind:"update",data:d})},
     delete:async function(){
       var r=await sb.from("docs").delete().eq("collection",c).eq("id",id);
       if(r.error)throw wrap(r.error);
@@ -455,7 +608,12 @@ var DB={
         if(cache[c])setTimeout(function(){next(snapshot(c))},0);
         else{
           cache[c]=null;
-          loadAll(c).then(function(o){cache[c]=o;notify(c)},function(e){if(err)err({code:"unavailable",message:String(e&&e.message)})});
+          loadAll(c).then(function(o){cache[c]=overlay(c,o);notify(c)},function(e){
+            kvGet(ukey("c:"+c)).then(function(sv){
+              if(sv){cache[c]=overlay(c,sv);notify(c)}
+              else if(err)err({code:"unavailable",message:String(e&&e.message)});
+            });
+          });
         }
         return function(){listeners[c]=(listeners[c]||[]).filter(function(f){return f!==next})};
       }
@@ -464,7 +622,7 @@ var DB={
   doc:function(path){var i=path.indexOf("/");return ref(path.slice(0,i),path.slice(i+1))}
 };
 /* a collection whose first load is still running must not receive realtime events */
-var _notify=notify;notify=function(c){if(cache[c]===null)return;_notify(c)};
+var _notify=notify;notify=function(c){if(cache[c]===null)return;_notify(c);persistLater(c)};
 
 /* ---------- who is signed in ---------- */
 var UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -539,7 +697,7 @@ async function init(){
   if(!window.supabase){q("#auth-form-body").hidden=true;q("#auth-offline").hidden=false;showAuth("");return}
   sb=window.supabase.createClient(C.url,C.key,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:false}});
   var s=await sb.auth.getSession();
-  if(s.data&&s.data.session)await start();else showAuth("");
+  if(s.data&&s.data.session)await start(s.data.session.user.id);else showAuth("");
 }
 init();
 })();
